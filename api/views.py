@@ -1,27 +1,44 @@
-import uuid
-from django.utils import timezone
+from django.shortcuts import render
 from django.db.models import Sum, F
+from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
-
-from .models import (
+from api.models import (
     UserProfile, Product, JobCard, LaborItem, JobPartItem,
     YardVehicle, ToolItem, ToolRental, DebtorCustomer,
     DebtRecord, Shift, StockAudit, StockAuditItem, Transaction
 )
-from .serializers import (
+from api.serializers import (
     UserProfileSerializer, ProductSerializer, JobCardSerializer,
     YardVehicleSerializer, ToolItemSerializer, ToolRentalSerializer,
     DebtorCustomerSerializer, DebtRecordSerializer, ShiftSerializer,
     StockAuditSerializer, TransactionSerializer
 )
 
+
+def _update_active_shift(cash_amount=0.0, mpesa_amount=0.0):
+    try:
+        active_shift = Shift.objects.filter(status='Open').order_by('-start_time').first()
+        if active_shift:
+            if cash_amount:
+                active_shift.total_cash_expected = float(active_shift.total_cash_expected) + float(cash_amount)
+            if mpesa_amount:
+                active_shift.total_mpesa_expected = float(active_shift.total_mpesa_expected) + float(mpesa_amount)
+            active_shift.save()
+    except Exception as e:
+        print(f'Error updating active shift: {e}')
+
+
 class AuthViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'], url_path='login')
     def login(self, request):
         role = request.data.get('role')
         pin = request.data.get('pin')
+
+        if not role or not pin:
+            return Response({'detail': 'Role and PIN are required'}, status=status.HTTP_400_BAD_REQUEST)
+
         user = UserProfile.objects.filter(role=role, pin=pin).first()
         if user:
             return Response(UserProfileSerializer(user).data)
@@ -41,6 +58,24 @@ class ProductViewSet(viewsets.ModelViewSet):
 class JobCardViewSet(viewsets.ModelViewSet):
     queryset = JobCard.objects.all().order_by('-created_at')
     serializer_class = JobCardSerializer
+
+    def perform_create(self, serializer):
+        job = serializer.save()
+        if job.advance_deposit and float(job.advance_deposit) > 0:
+            Transaction.objects.create(
+                type='JOB_ADVANCE',
+                reference_id=job.id,
+                reference_no=job.job_no,
+                description=f'Advance Deposit for {job.car_reg_no} ({job.car_make_model})',
+                gross_amount=float(job.advance_deposit),
+                cost_amount=0,
+                profit_amount=float(job.advance_deposit),
+                payment_method='Cash',
+                mpesa_amount=0,
+                cash_amount=float(job.advance_deposit),
+                cashier_name='Service Advisor'
+            )
+            _update_active_shift(cash_amount=float(job.advance_deposit))
 
     @action(detail=True, methods=['post'], url_path='settle')
     def settle(self, request, pk=None):
@@ -79,6 +114,7 @@ class JobCardViewSet(viewsets.ModelViewSet):
                 mpesa_ref=mpesa_ref,
                 cashier_name=request.data.get('cashierName', 'Workshop Staff')
             )
+            _update_active_shift(cash_amount=cash_amount, mpesa_amount=mpesa_amount)
 
         return Response(JobCardSerializer(job).data)
 
@@ -105,6 +141,8 @@ class YardVehicleViewSet(viewsets.ModelViewSet):
         vehicle.save()
 
         if amount_paid > 0:
+            mpesa_amt = amount_paid if payment_method == 'Mpesa' else 0
+            cash_amt = amount_paid if payment_method == 'Cash' else 0
             Transaction.objects.create(
                 type='YARD_FEE',
                 reference_id=vehicle.id,
@@ -114,11 +152,12 @@ class YardVehicleViewSet(viewsets.ModelViewSet):
                 cost_amount=0,
                 profit_amount=amount_paid,
                 payment_method=payment_method,
-                mpesa_amount=amount_paid if payment_method == 'Mpesa' else 0,
-                cash_amount=amount_paid if payment_method == 'Cash' else 0,
+                mpesa_amount=mpesa_amt,
+                cash_amount=cash_amt,
                 mpesa_ref=mpesa_ref,
                 cashier_name=cashier_name
             )
+            _update_active_shift(cash_amount=cash_amt, mpesa_amount=mpesa_amt)
 
         return Response(YardVehicleSerializer(vehicle).data)
 
@@ -141,6 +180,8 @@ class ToolRentalViewSet(viewsets.ModelViewSet):
         ToolItem.objects.filter(id=rental.tool_id).update(status='Rented')
 
         total_payment = float(rental.total_hire_fee) + float(rental.deposit_paid)
+        mpesa_amt = total_payment if rental.payment_method == 'Mpesa' else 0
+        cash_amt = total_payment if rental.payment_method == 'Cash' else 0
         Transaction.objects.create(
             type='TOOL_RENTAL',
             reference_id=rental.id,
@@ -150,11 +191,12 @@ class ToolRentalViewSet(viewsets.ModelViewSet):
             cost_amount=0,
             profit_amount=float(rental.total_hire_fee),
             payment_method=rental.payment_method,
-            mpesa_amount=total_payment if rental.payment_method == 'Mpesa' else 0,
-            cash_amount=total_payment if rental.payment_method == 'Cash' else 0,
+            mpesa_amount=mpesa_amt,
+            cash_amount=cash_amt,
             mpesa_ref=rental.mpesa_ref,
             cashier_name=request.data.get('cashierName', 'Tool Desk')
         )
+        _update_active_shift(cash_amount=cash_amt, mpesa_amount=mpesa_amt)
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -204,6 +246,8 @@ class DebtorCustomerViewSet(viewsets.ModelViewSet):
             cashier_name=cashier_name
         )
 
+        mpesa_amt = amount if payment_method == 'Mpesa' else 0
+        cash_amt = amount if payment_method == 'Cash' else 0
         Transaction.objects.create(
             type='DEBT_REPAYMENT',
             reference_id=debtor.id,
@@ -213,11 +257,12 @@ class DebtorCustomerViewSet(viewsets.ModelViewSet):
             cost_amount=0,
             profit_amount=amount,
             payment_method=payment_method,
-            mpesa_amount=amount if payment_method == 'Mpesa' else 0,
-            cash_amount=amount if payment_method == 'Cash' else 0,
+            mpesa_amount=mpesa_amt,
+            cash_amount=cash_amt,
             mpesa_ref=mpesa_ref,
             cashier_name=cashier_name
         )
+        _update_active_shift(cash_amount=cash_amt, mpesa_amount=mpesa_amt)
 
         return Response({
             'debtor': DebtorCustomerSerializer(debtor).data,
@@ -346,6 +391,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
             mpesa_ref=mpesa_ref,
             cashier_name=cashier_name
         )
+        if payment_method != 'Credit':
+            _update_active_shift(cash_amount=cash_amount, mpesa_amount=mpesa_amount)
 
         return Response(TransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
 
